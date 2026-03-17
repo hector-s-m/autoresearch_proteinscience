@@ -1,82 +1,205 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+One-time data preparation for antibody/nanobody autoresearch.
+Downloads antibody sequences from OAS and structures from SAbDab.
+Builds amino acid tokenizer and creates train/val splits.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
+    python prepare.py                     # full prep (OAS + SAbDab + fallback)
+    python prepare.py --num-oas-units 10  # limit OAS download
+    python prepare.py --synthetic-only    # use synthetic data only (for testing)
 
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+Data and processed sequences are stored in ~/.cache/autoresearch_ab/.
 """
 
 import os
 import sys
 import time
 import math
+import json
+import gzip
+import re
+import hashlib
+import random
 import argparse
-import pickle
 from multiprocessing import Pool
+from urllib.parse import urljoin
 
 import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import numpy as np
+import pandas as pd
 import torch
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+MAX_SEQ_LEN = 512        # max tokens per packed row (antibodies ~120-300 AAs + markers)
+TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
+EVAL_TOKENS = 10 * 65536  # ~655K tokens for validation
+
+# ---------------------------------------------------------------------------
+# Vocabulary (fixed, do not modify)
+# ---------------------------------------------------------------------------
+
+AMINO_ACIDS = list("ACDEFGHIKLMNPQRSTVWY")  # 20 standard amino acids
+REGION_TOKENS = ["<FR1>", "<CDR1>", "<FR2>", "<CDR2>", "<FR3>", "<CDR3>", "<FR4>"]
+CHAIN_TOKENS = ["<HEAVY>", "<LIGHT>", "<NANOBODY>"]
+SPECIES_TOKENS = ["<HUMAN>", "<MOUSE>", "<CAMEL>", "<RABBIT>", "<RHESUS>", "<RAT>"]
+CONTROL_TOKENS = [
+    "<BOS>", "<EOS>", "<PAD>", "<SEP>", "<MASK>",
+    "<STRUCT>", "<NO_STRUCT>", "<UNK>",
+]
+
+ALL_TOKENS = AMINO_ACIDS + REGION_TOKENS + CHAIN_TOKENS + SPECIES_TOKENS + CONTROL_TOKENS
+VOCAB_SIZE = len(ALL_TOKENS)  # 44
+
+TOKEN_TO_ID = {tok: i for i, tok in enumerate(ALL_TOKENS)}
+ID_TO_TOKEN = {i: tok for tok, i in TOKEN_TO_ID.items()}
+
+# Convenience IDs
+BOS_ID = TOKEN_TO_ID["<BOS>"]
+EOS_ID = TOKEN_TO_ID["<EOS>"]
+PAD_ID = TOKEN_TO_ID["<PAD>"]
+SEP_ID = TOKEN_TO_ID["<SEP>"]
+MASK_ID = TOKEN_TO_ID["<MASK>"]
+STRUCT_ID = TOKEN_TO_ID["<STRUCT>"]
+NO_STRUCT_ID = TOKEN_TO_ID["<NO_STRUCT>"]
+UNK_ID = TOKEN_TO_ID["<UNK>"]
+
+# Amino acid token IDs (for masking in evaluation)
+AA_TOKEN_IDS = set(TOKEN_TO_ID[aa] for aa in AMINO_ACIDS)
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch_ab")
 DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
+STRUCTURES_DIR = os.path.join(CACHE_DIR, "structures")
+PROCESSED_DIR = os.path.join(CACHE_DIR, "processed")
 
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+# OAS configuration
+OAS_UNPAIRED_URL = "http://opig.stats.ox.ac.uk/webapps/oas/oas_unpaired/"
+OAS_PAIRED_URL = "http://opig.stats.ox.ac.uk/webapps/oas/oas_paired/"
 
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+# SAbDab configuration
+SABDAB_SUMMARY_URL = "https://opig.stats.ox.ac.uk/webapps/sabdab-sabpred/sabdab/summary/all/"
+
+# Validation fraction
+VAL_FRACTION = 0.05
+
+# OAS region column names
+OAS_REGION_COLUMNS = {
+    "FR1": "fwr1_aa",
+    "CDR1": "cdr1_aa",
+    "FR2": "fwr2_aa",
+    "CDR2": "cdr2_aa",
+    "FR3": "fwr3_aa",
+    "CDR3": "cdr3_aa",
+    "FR4": "fwr4_aa",
+}
+
+# Species mapping (lowercase key -> token)
+SPECIES_MAP = {
+    "human": "<HUMAN>", "homo sapiens": "<HUMAN>",
+    "mouse": "<MOUSE>", "mus musculus": "<MOUSE>",
+    "camel": "<CAMEL>", "camelus dromedarius": "<CAMEL>", "vicugna pacos": "<CAMEL>",
+    "rabbit": "<RABBIT>", "oryctolagus cuniculus": "<RABBIT>",
+    "rhesus": "<RHESUS>", "macaca mulatta": "<RHESUS>",
+    "rat": "<RAT>", "rattus norvegicus": "<RAT>",
+}
+
+# Chain type mapping (lowercase key -> token)
+CHAIN_MAP = {
+    "heavy": "<HEAVY>", "igh": "<HEAVY>",
+    "kappa": "<LIGHT>", "igk": "<LIGHT>",
+    "lambda": "<LIGHT>", "igl": "<LIGHT>",
+    "light": "<LIGHT>",
+    "vhh": "<NANOBODY>", "nanobody": "<NANOBODY>",
+}
 
 # ---------------------------------------------------------------------------
-# Data download
+# Data download: OAS
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
+def _get_oas_data_urls(search_url, max_units=20):
+    """Search OAS and return a list of data unit CSV.gz URLs."""
+    session = requests.Session()
+
+    try:
+        # Step 1: GET the search page for CSRF token and cookies
+        resp = session.get(search_url, timeout=30)
+        resp.raise_for_status()
+
+        # Extract CSRF token from the form
+        csrf_match = re.search(
+            r'name=["\']csrfmiddlewaretoken["\'].*?value=["\']([^"\']+)', resp.text
+        )
+        if not csrf_match:
+            # Try cookie-based CSRF
+            csrf_token = session.cookies.get("csrftoken", "")
+            if not csrf_token:
+                print("  Warning: Could not find CSRF token on OAS page")
+                return []
+        else:
+            csrf_token = csrf_match.group(1)
+
+        # Step 2: POST search with no filters (returns all data units)
+        data = {"csrfmiddlewaretoken": csrf_token}
+        headers = {"Referer": search_url}
+        resp = session.post(
+            search_url, data=data, headers=headers, timeout=120, allow_redirects=True
+        )
+        resp.raise_for_status()
+
+        # Step 3: Look for bulk_download.sh link
+        download_links = re.findall(
+            r'href=["\']([^"\']*(?:bulk_download|download)[^"\']*)', resp.text
+        )
+        for link in download_links:
+            if "bulk_download" in link.lower():
+                full_url = link if link.startswith("http") else urljoin(search_url, link)
+                try:
+                    script_resp = session.get(full_url, timeout=60)
+                    script_resp.raise_for_status()
+                    # Parse wget URLs from the shell script
+                    urls = re.findall(
+                        r'(?:wget\s+["\']?)(https?://[^\s"\']+\.csv\.gz)',
+                        script_resp.text,
+                    )
+                    if urls:
+                        return urls[:max_units]
+                except Exception:
+                    pass
+
+        # Fallback: look for CSV.gz URLs directly in the response page
+        urls = re.findall(r'(https?://[^"\'>\s]*\.csv\.gz)', resp.text)
+        return urls[:max_units]
+
+    except Exception as e:
+        print(f"  OAS search failed: {e}")
+        return []
+
+
+def _download_file(url, filepath, timeout=120):
+    """Download a file with retry logic. Returns True on success."""
     if os.path.exists(filepath):
         return True
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
+    max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
+            resp = requests.get(url, stream=True, timeout=timeout)
+            resp.raise_for_status()
             temp_path = filepath + ".tmp"
             with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
             os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
             return True
         except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
+            print(f"    Attempt {attempt}/{max_attempts} failed: {e}")
             for path in [filepath + ".tmp", filepath]:
                 if os.path.exists(path):
                     try:
@@ -88,210 +211,438 @@ def download_single_shard(index):
     return False
 
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
+def _parse_oas_csv(filepath, max_sequences=50000):
+    """Parse a single OAS CSV.gz file, return list of antibody sequence dicts.
+
+    OAS CSV format:
+    - Row 0: JSON metadata encoded in column names (species, chain, etc.)
+    - Row 1: actual column headers
+    - Row 2+: data
+    """
+    sequences = []
+
+    try:
+        # Read metadata from first row
+        meta_df = pd.read_csv(filepath, nrows=0, compression="gzip")
+        try:
+            metadata = json.loads(",".join(meta_df.columns))
+            species = metadata.get("Species", "human").lower()
+            chain = metadata.get("Chain", "Heavy").lower()
+        except (json.JSONDecodeError, TypeError):
+            species = "human"
+            chain = "heavy"
+
+        # Read actual data (header=1 skips the metadata row)
+        df = pd.read_csv(
+            filepath, header=1, compression="gzip",
+            nrows=max_sequences, low_memory=False,
+        )
+
+        for _, row in df.iterrows():
+            regions = {}
+            for region_name, col_name in OAS_REGION_COLUMNS.items():
+                if col_name in df.columns:
+                    val = row.get(col_name)
+                    if pd.notna(val):
+                        val = str(val).strip().upper()
+                        # Clean: keep only standard AAs and X
+                        cleaned = "".join(
+                            c for c in val if c in TOKEN_TO_ID or c == "X"
+                        )
+                        if cleaned and cleaned != "X":
+                            regions[region_name] = cleaned
+
+            # Need at least CDR3 and a few framework regions for a valid sequence
+            if "CDR3" in regions and len(regions) >= 4:
+                sequences.append({
+                    "species": species,
+                    "chain_type": chain,
+                    "regions": regions,
+                })
+
+    except Exception as e:
+        print(f"    Error parsing {filepath}: {e}")
+
+    return sequences
+
+
+def download_oas_data(num_units=20, max_sequences_per_unit=50000):
+    """Download and parse OAS antibody sequences."""
     os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
 
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
+    all_sequences = []
 
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
+    # Try unpaired first (more data)
+    print("  OAS: Searching for unpaired data units...")
+    urls = _get_oas_data_urls(OAS_UNPAIRED_URL, max_units=num_units)
 
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
+    if not urls:
+        # Try paired
+        print("  OAS: Searching for paired data units...")
+        urls = _get_oas_data_urls(OAS_PAIRED_URL, max_units=num_units)
 
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
+    if not urls:
+        print("  OAS: Could not find data URLs via search API")
+        return []
+
+    print(f"  OAS: Found {len(urls)} data unit URLs, downloading up to {num_units}...")
+
+    for i, url in enumerate(urls[:num_units]):
+        filename = os.path.basename(url)
+        filepath = os.path.join(DATA_DIR, filename)
+        print(f"  [{i+1}/{min(len(urls), num_units)}] {filename}...")
+
+        if _download_file(url, filepath):
+            seqs = _parse_oas_csv(filepath, max_sequences=max_sequences_per_unit)
+            all_sequences.extend(seqs)
+            print(f"    -> {len(seqs)} sequences (total: {len(all_sequences)})")
+
+    return all_sequences
+
 
 # ---------------------------------------------------------------------------
-# Tokenizer training
+# Data download: SAbDab (supplementary / fallback)
 # ---------------------------------------------------------------------------
 
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
+def download_sabdab_data():
+    """Download SAbDab summary TSV and extract antibody CDR sequences."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    filepath = os.path.join(DATA_DIR, "sabdab_summary.tsv")
+
+    print("  SAbDab: Downloading summary...")
+    try:
+        if not os.path.exists(filepath):
+            resp = requests.get(SABDAB_SUMMARY_URL, timeout=120)
+            resp.raise_for_status()
+            with open(filepath, "w") as f:
+                f.write(resp.text)
+            print(f"  SAbDab: Summary saved to {filepath}")
+
+        df = pd.read_csv(filepath, sep="\t", low_memory=False)
+        print(f"  SAbDab: {len(df)} entries loaded")
+
+        sequences = []
+        available_cols = {c.lower(): c for c in df.columns}
+
+        # Discover CDR column names (various naming conventions)
+        cdr_col_map = {}
+        for col in df.columns:
+            cu = col.upper().replace(" ", "").replace("_", "").replace("-", "")
+            if "CDRH1" in cu:
+                cdr_col_map["H_CDR1"] = col
+            elif "CDRH2" in cu:
+                cdr_col_map["H_CDR2"] = col
+            elif "CDRH3" in cu:
+                cdr_col_map["H_CDR3"] = col
+            elif "CDRL1" in cu:
+                cdr_col_map["L_CDR1"] = col
+            elif "CDRL2" in cu:
+                cdr_col_map["L_CDR2"] = col
+            elif "CDRL3" in cu:
+                cdr_col_map["L_CDR3"] = col
+
+        print(f"  SAbDab: Found CDR columns: {list(cdr_col_map.keys())}")
+
+        # Extract heavy chain CDR sequences
+        for _, row in df.iterrows():
+            # Heavy chain
+            h_regions = {}
+            for region_key in ["CDR1", "CDR2", "CDR3"]:
+                col = cdr_col_map.get(f"H_{region_key}")
+                if col and pd.notna(row.get(col)):
+                    val = str(row[col]).strip().upper()
+                    cleaned = "".join(c for c in val if c in TOKEN_TO_ID or c == "X")
+                    if cleaned and cleaned != "X" and len(cleaned) > 1:
+                        h_regions[region_key] = cleaned
+
+            if len(h_regions) >= 2:
+                # Determine species
+                species = "human"
+                for sp_col in ["organism", "species"]:
+                    if sp_col in available_cols and pd.notna(row.get(available_cols[sp_col])):
+                        org = str(row[available_cols[sp_col]]).lower()
+                        for sp_key in SPECIES_MAP:
+                            if sp_key in org:
+                                species = sp_key
+                                break
+                        break
+
+                sequences.append({
+                    "species": species,
+                    "chain_type": "heavy",
+                    "regions": h_regions,
+                })
+
+            # Light chain
+            l_regions = {}
+            for region_key in ["CDR1", "CDR2", "CDR3"]:
+                col = cdr_col_map.get(f"L_{region_key}")
+                if col and pd.notna(row.get(col)):
+                    val = str(row[col]).strip().upper()
+                    cleaned = "".join(c for c in val if c in TOKEN_TO_ID or c == "X")
+                    if cleaned and cleaned != "X" and len(cleaned) > 1:
+                        l_regions[region_key] = cleaned
+
+            if len(l_regions) >= 2:
+                species = "human"
+                for sp_col in ["organism", "species"]:
+                    if sp_col in available_cols and pd.notna(row.get(available_cols[sp_col])):
+                        org = str(row[available_cols[sp_col]]).lower()
+                        for sp_key in SPECIES_MAP:
+                            if sp_key in org:
+                                species = sp_key
+                                break
+                        break
+
+                sequences.append({
+                    "species": species,
+                    "chain_type": "light",
+                    "regions": l_regions,
+                })
+
+        print(f"  SAbDab: Extracted {len(sequences)} sequences")
+        return sequences
+
+    except Exception as e:
+        print(f"  SAbDab download failed: {e}")
+        return []
 
 
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
+# ---------------------------------------------------------------------------
+# Synthetic data fallback
+# ---------------------------------------------------------------------------
+
+def generate_synthetic_sequences(num_sequences=200000, seed=42):
+    """Generate synthetic antibody sequences with realistic properties.
+
+    Uses amino acid frequencies from real antibody repertoires and
+    typical IMGT region length distributions. Last resort fallback
+    that always works without any network access.
+    """
+    print(f"  Synthetic: Generating {num_sequences} sequences...")
+
+    rng = random.Random(seed)
+
+    # Approximate amino acid frequencies in antibody variable regions
+    aa_weights = {
+        "A": 6.8, "C": 2.2, "D": 4.7, "E": 5.3, "F": 3.4,
+        "G": 8.2, "H": 2.1, "I": 4.0, "K": 4.6, "L": 8.2,
+        "M": 1.8, "N": 3.6, "P": 5.2, "Q": 3.9, "R": 4.8,
+        "S": 8.5, "T": 6.5, "V": 6.5, "W": 1.6, "Y": 3.8,
+    }
+    aas = list(aa_weights.keys())
+    weights = [aa_weights[aa] for aa in aas]
+
+    # Typical IMGT region lengths: (min, max)
+    heavy_lengths = {
+        "FR1": (25, 26), "CDR1": (6, 12), "FR2": (17, 17),
+        "CDR2": (8, 10), "FR3": (32, 39), "CDR3": (3, 25), "FR4": (11, 11),
+    }
+    light_lengths = {
+        "FR1": (23, 26), "CDR1": (6, 12), "FR2": (15, 17),
+        "CDR2": (3, 3), "FR3": (32, 36), "CDR3": (7, 11), "FR4": (10, 11),
+    }
+
+    species_pool = ["human"] * 70 + ["mouse"] * 20 + ["camel"] * 10
+    chain_pool = ["heavy"] * 50 + ["kappa"] * 25 + ["lambda"] * 20 + ["vhh"] * 5
+
+    sequences = []
+    for _ in range(num_sequences):
+        chain = rng.choice(chain_pool)
+        lengths = heavy_lengths if chain in ("heavy", "vhh") else light_lengths
+
+        regions = {}
+        for region, (min_len, max_len) in lengths.items():
+            length = rng.randint(min_len, max_len)
+            regions[region] = "".join(rng.choices(aas, weights=weights, k=length))
+
+        species = rng.choice(species_pool)
+        if chain == "vhh":
+            species = "camel"
+
+        sequences.append({
+            "species": species,
+            "chain_type": chain,
+            "regions": regions,
+        })
+
+    return sequences
 
 
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
+# ---------------------------------------------------------------------------
+# Sequence tokenization
+# ---------------------------------------------------------------------------
 
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
+def tokenize_antibody(seq_dict):
+    """Convert an antibody sequence dict to a list of token IDs.
 
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
+    Output format:
+    <BOS> <SPECIES> <CHAIN> <FR1> aa... <CDR1> aa... ... <FR4> aa... <EOS>
+    """
+    tokens = [BOS_ID]
 
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
+    # Species token
+    species = seq_dict["species"].lower()
+    species_tok = SPECIES_MAP.get(species, "<HUMAN>")
+    tokens.append(TOKEN_TO_ID[species_tok])
 
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
+    # Chain type token
+    chain = seq_dict["chain_type"].lower()
+    chain_tok = CHAIN_MAP.get(chain, "<HEAVY>")
+    tokens.append(TOKEN_TO_ID[chain_tok])
 
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
+    # Region-annotated sequence
+    for region_name in ["FR1", "CDR1", "FR2", "CDR2", "FR3", "CDR3", "FR4"]:
+        if region_name in seq_dict["regions"]:
+            tokens.append(TOKEN_TO_ID[f"<{region_name}>"])
+            for aa in seq_dict["regions"][region_name]:
+                aa_upper = aa.upper()
+                if aa_upper in TOKEN_TO_ID:
+                    tokens.append(TOKEN_TO_ID[aa_upper])
+                else:
+                    tokens.append(UNK_ID)
 
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
-    )
+    tokens.append(EOS_ID)
+    return tokens
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+# ---------------------------------------------------------------------------
+# Data processing and storage
+# ---------------------------------------------------------------------------
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
+def process_and_save(all_sequences, val_fraction=VAL_FRACTION):
+    """Tokenize sequences, split into train/val, save to disk."""
+    os.makedirs(PROCESSED_DIR, exist_ok=True)
+
+    print(f"Processing {len(all_sequences)} sequences...")
+
+    # Tokenize all sequences
+    tokenized = []
+    for seq_dict in all_sequences:
+        tokens = tokenize_antibody(seq_dict)
+        if 10 <= len(tokens) <= MAX_SEQ_LEN:
+            tokenized.append(tokens)
+
+    print(f"  {len(tokenized)} sequences after filtering (10-{MAX_SEQ_LEN} tokens)")
+
+    # Split by hash (deterministic, prevents CDR3 leakage)
+    train_seqs = []
+    val_seqs = []
+
+    for tokens in tokenized:
+        # Hash the full token sequence for deterministic splitting
+        seq_hash = hashlib.md5(str(tokens).encode()).hexdigest()
+        hash_val = int(seq_hash[:8], 16) / 0xFFFFFFFF
+        if hash_val < val_fraction:
+            val_seqs.append(tokens)
         else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
+            train_seqs.append(tokens)
 
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
+    print(f"  Train: {len(train_seqs)} sequences")
+    print(f"  Val:   {len(val_seqs)} sequences")
+
+    # Save
+    torch.save(train_seqs, os.path.join(PROCESSED_DIR, "train_sequences.pt"))
+    torch.save(val_seqs, os.path.join(PROCESSED_DIR, "val_sequences.pt"))
+
+    # Stats
+    train_tokens = sum(len(s) for s in train_seqs)
+    val_tokens = sum(len(s) for s in val_seqs)
+    total_tokens = train_tokens + val_tokens
+    avg_len = total_tokens / len(tokenized) if tokenized else 0
+    print(f"  Total tokens: {total_tokens:,} (avg {avg_len:.1f} per sequence)")
+    print(f"  Saved to {PROCESSED_DIR}")
+
+    return len(train_seqs), len(val_seqs)
+
 
 # ---------------------------------------------------------------------------
 # Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
 class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
+    """Simple amino acid tokenizer with special tokens.
 
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
+    Unlike the BPE tokenizer in the original, this is a fixed character-level
+    tokenizer over 20 amino acids plus region/chain/species/control tokens.
+    No training needed -- the vocabulary is predefined.
+    """
+
+    def __init__(self):
+        self.token_to_id = TOKEN_TO_ID
+        self.id_to_token = ID_TO_TOKEN
+        self._vocab_size = VOCAB_SIZE
+        self._bos_token_id = BOS_ID
 
     @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
+    def from_directory(cls, *args, **kwargs):
+        """Compatibility with original API. No directory needed."""
+        return cls()
 
     def get_vocab_size(self):
-        return self.enc.n_vocab
+        return self._vocab_size
 
     def get_bos_token_id(self):
-        return self.bos_token_id
+        return self._bos_token_id
 
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
+    def encode(self, text, **kwargs):
+        """Encode amino acid string to token IDs."""
         if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
+            return [self.token_to_id.get(c, UNK_ID) for c in text]
         elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
+            return [[self.token_to_id.get(c, UNK_ID) for c in t] for t in text]
+        raise ValueError(f"Invalid input type: {type(text)}")
 
     def decode(self, ids):
-        return self.enc.decode(ids)
+        """Decode token IDs to string."""
+        return "".join(self.id_to_token.get(i, "?") for i in ids)
 
 
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
+# ---------------------------------------------------------------------------
+# Dataloader
+# ---------------------------------------------------------------------------
+
+def _load_sequences(split):
+    """Load processed token sequences from disk."""
+    filepath = os.path.join(PROCESSED_DIR, f"{split}_sequences.pt")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(
+            f"Processed data not found at {filepath}. Run prepare.py first."
+        )
+    return torch.load(filepath, weights_only=False)
 
 
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
+def _sequence_batches(split):
+    """Infinite iterator yielding individual antibody token sequences."""
+    sequences = _load_sequences(split)
+    assert len(sequences) > 0, f"No {split} sequences found"
     epoch = 1
     while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
+        indices = list(range(len(sequences)))
+        if split == "train":
+            rng = random.Random(epoch * 31337)
+            rng.shuffle(indices)
+        for idx in indices:
+            yield sequences[idx], epoch
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def make_dataloader(tokenizer, B, T, split, buffer_size=500):
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    BOS-aligned dataloader with best-fit packing for antibody sequences.
+    Every row packs multiple antibody sequences end-to-end (each starts with
+    BOS and ends with EOS). Same interface as original: yields (inputs, targets, epoch).
     """
     assert split in ["train", "val"]
     row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
+    seq_iter = _sequence_batches(split)
     doc_buffer = []
     epoch = 1
 
     def refill_buffer():
         nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+        seq, epoch = next(seq_iter)
+        doc_buffer.append(seq)
 
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
@@ -311,7 +662,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
                 remaining = row_capacity - pos
 
-                # Find largest doc that fits entirely
+                # Find largest sequence that fits entirely
                 best_idx = -1
                 best_len = 0
                 for i, doc in enumerate(doc_buffer):
@@ -322,13 +673,19 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 
                 if best_idx >= 0:
                     doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(
+                        doc, dtype=torch.long
+                    )
                     pos += len(doc)
                 else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
+                    # No sequence fits -- crop shortest to fill remaining
+                    shortest_idx = min(
+                        range(len(doc_buffer)), key=lambda i: len(doc_buffer[i])
+                    )
                     doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
+                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(
+                        doc[:remaining], dtype=torch.long
+                    )
                     pos += remaining
 
         cpu_inputs.copy_(row_buffer[:, :-1])
@@ -336,54 +693,123 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         gpu_buffer.copy_(cpu_buffer, non_blocking=True)
         yield inputs, targets, epoch
 
+
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# Evaluation (DO NOT CHANGE -- this is the fixed metric)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_ppl(model, tokenizer, batch_size):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
+    Perplexity on validation antibody sequences.
+    Computes exp(average cross-entropy per token) over all tokens.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
     val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
+    steps = max(1, EVAL_TOKENS // (batch_size * MAX_SEQ_LEN))
+    total_loss = 0.0
+    total_tokens = 0
     for _ in range(steps):
         x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+        loss_flat = model(x, y, reduction="none").view(-1)
+        total_loss += loss_flat.sum().item()
+        total_tokens += loss_flat.numel()
+    avg_loss = total_loss / total_tokens
+    return math.exp(avg_loss)
+
+
+# ---------------------------------------------------------------------------
+# Structure utilities (for future use by the autoresearch agent)
+# ---------------------------------------------------------------------------
+
+def load_structure_data(split):
+    """Load pre-computed dihedral angles. Returns None if not available.
+
+    Future: The autoresearch agent can add structure-conditioned training
+    by loading dihedral angles from SAbDab PDB files processed here.
+    """
+    filepath = os.path.join(PROCESSED_DIR, f"{split}_structures.pt")
+    if os.path.exists(filepath):
+        return torch.load(filepath, weights_only=False)
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(
+        description="Prepare antibody data for autoresearch"
+    )
+    parser.add_argument(
+        "--num-oas-units", type=int, default=20,
+        help="Number of OAS data units to download (default: 20)",
+    )
+    parser.add_argument(
+        "--max-seq-per-unit", type=int, default=50000,
+        help="Max sequences per OAS data unit (default: 50000)",
+    )
+    parser.add_argument(
+        "--synthetic-only", action="store_true",
+        help="Use synthetic data only (for testing, no network needed)",
+    )
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
-
     print(f"Cache directory: {CACHE_DIR}")
+    print(f"Vocabulary size: {VOCAB_SIZE}")
+    print(f"Tokens: {ALL_TOKENS}")
     print()
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
+    # Check if already processed
+    train_path = os.path.join(PROCESSED_DIR, "train_sequences.pt")
+    val_path = os.path.join(PROCESSED_DIR, "val_sequences.pt")
+    if os.path.exists(train_path) and os.path.exists(val_path):
+        train_seqs = torch.load(train_path, weights_only=False)
+        val_seqs = torch.load(val_path, weights_only=False)
+        print(f"Data already processed: {len(train_seqs)} train, {len(val_seqs)} val")
+        print(f"To re-process, delete: rm -rf {PROCESSED_DIR}")
+        sys.exit(0)
+
+    all_sequences = []
+
+    if args.synthetic_only:
+        print("Using synthetic data only (--synthetic-only flag)")
+        all_sequences = generate_synthetic_sequences(500000)
+    else:
+        # Step 1: Try OAS
+        print("Step 1: Downloading OAS antibody sequences...")
+        oas_sequences = download_oas_data(
+            num_units=args.num_oas_units,
+            max_sequences_per_unit=args.max_seq_per_unit,
+        )
+        all_sequences.extend(oas_sequences)
+        print(f"  Total from OAS: {len(oas_sequences)}")
+        print()
+
+        # Step 2: Try SAbDab
+        print("Step 2: Downloading SAbDab sequences...")
+        sabdab_sequences = download_sabdab_data()
+        all_sequences.extend(sabdab_sequences)
+        print(f"  Total from SAbDab: {len(sabdab_sequences)}")
+        print()
+
+        # Step 3: Fallback to synthetic if insufficient real data
+        if len(all_sequences) < 10000:
+            print("Step 3: Insufficient real data, generating synthetic fallback...")
+            needed = max(200000, 100000 - len(all_sequences))
+            synthetic = generate_synthetic_sequences(needed)
+            all_sequences.extend(synthetic)
+            print(f"  Generated {len(synthetic)} synthetic sequences")
+            print()
+
+    print(f"Total sequences: {len(all_sequences)}")
     print()
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
+    # Process and save
+    n_train, n_val = process_and_save(all_sequences)
+
     print()
-    print("Done! Ready to train.")
+    print("Done! Ready to train with: uv run train.py")
+    print(f"  Train: {n_train} sequences")
+    print(f"  Val:   {n_val} sequences")

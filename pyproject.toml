@@ -1,10 +1,11 @@
 [project]
 name = "autoresearch"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "Autonomous antibody/nanobody design research"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "biopython>=1.83",
     "kernels>=0.11.7",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
